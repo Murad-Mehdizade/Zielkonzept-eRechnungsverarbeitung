@@ -1,110 +1,165 @@
-# Zielkonzept eRechnungsverarbeitung
+# Architektur eRechnungsverarbeitung
 
-Ziel ist eine vollständig automatisierte Verarbeitung elektronischer Rechnungen, bei der jeweils eine einzelne E-Mail die Verarbeitungseinheit ist.
+## Architekturprinzipien
 
-Anders als heute werden keine PDF-Dateien mehr zusammengeführt und keine Sammelimporte mehr erzeugt. Jede eingehende E-Mail ist ein eigenständiger Vorgang und wird unabhängig von anderen Rechnungen verarbeitet.
+- **Eine E-Mail entspricht genau einem Vorgang.**
+- **Jede E-Mail erhält eine eigene Import-ID.**
+- **Keine Sammel-PDFs und kein PDF-Merge mehr.**
+- **Fehlerhafte Rechnungen blockieren keine anderen Rechnungen.**
+- **Vorhandene Validierungslogik wird wiederverwendet** (`ImportValidateData`, `DocumentFunctions`).
+- **Vorhandene D365-Schnittstelle wird wiederverwendet** (`DocumentsSaveData.sentToD365()`).
+- **Vorhandene Klärfalllogik wird wiederverwendet** (`saveDocumentClarification()`).
+- **Gutschriften werden bis zur fachlichen Entscheidung immer als Klärfall behandelt.**
+- **Vermieter-Rechnungen werden nicht automatisch fakturiert**, sondern in einen Freigabeprozess überführt.
 
-## Zielbild
+## Ablauf
 
 ```mermaid
 flowchart TD
-    A[E-Mail-Eingang] --> B[E-Mail einlesen<br/>Metadaten + Anhänge]
-    B --> C{Format unterstützt<br/>und lesbar?}
-    C -- Nein --> K1[Klärfall<br/>technischer Fehler]
-    C -- Ja --> D[Daten ins Dokumentmodell]
-    D --> E[Befunde erheben<br/>Belegart · Validierung · Dublette · Vermieter]
-    E --> F{Validierung ok?}
-    F -- Nein --> K2[Klärfall<br/>fachlicher Fehler]
-    F -- Ja --> G{Dublette?}
-    G -- Ja --> K3[Klärfall<br/>Dublettenverdacht]
-    G -- Nein --> H{Gutschrift?}
-    H -- Ja --> K4[Klärfall<br/>Gutschrift]
-    H -- Nein --> I{Vermieter?}
-    I -- Ja --> P[Freigabepool<br/>Freigabe ausstehend]
-    I -- Nein --> S[Status: Geprüft]
-    P -. nach Freigabe .-> S
-    S --> X[Übergabe D365<br/>Fakturierung]
+    M(["<b>E-Mail-Eingang</b><br/>1 E-Mail = 1 Vorgang = 1 Import-ID"])
+    R["<b>ERechnungMailReader</b><br/>liest Mail per Graph<br/><i>Basis: ImportGetMails</i><br/>erzeugt ERechnungMail + ImportList-Eintrag"]
+    P["<b>ERechnungParser</b><br/>liest PDF/XML<br/><i>Basis: ConvertZUGFeRD</i><br/>erzeugt DataDocumentHead, DataDocumentItem, TaxData"]
+    V["<b>ERechnungValidator</b><br/>nutzt ImportValidateData + DocumentFunctions<br/>liefert ValidationResult / ValidationError"]
+    D{"<b>ERechnungProcessor</b><br/>Entscheidung"}
+    M --> R --> P --> V --> D
+    D -->|"A: nicht lesbar /<br/>Validierung fehlgeschlagen"| A1["<b>Status 4 Klärfall</b><br/>saveDocumentClarification()"]
+    D -->|"B: Gutschrift"| B1["<b>Status 4 Klärfall</b><br/>fachliche Entscheidung offen<br/>keine Fakturierung"]
+    A1 --> K["<b>Bestehender Klärungsprozess</b><br/>DocumentClarificationModelClass<br/>DocumentOverviewTable"]
+    B1 --> K
+    D -->|"C: Payer = Vermieter"| C1["<b>Status 8 Freigabe ausstehend</b><br/>gespeichert, keine D365-Übergabe"]
+    D -->|"D: Standardrechnung"| G3["<b>Status 3 Geprüft</b>"]
+    C1 -. "manuelle Genehmigung" .-> G3
+    G3 --> G4["<b>DocumentsSaveData.sentToD365()</b>"]
+    G4 --> G5["<b>Status 5 Fakturiert</b>"]
 
+    classDef neu fill:#E1F5EE,stroke:#0F6E56,color:#085041
     classDef klaer fill:#FAECE7,stroke:#993C1D,color:#712B13
     classDef frei fill:#FAEEDA,stroke:#854F0B,color:#633806
-    classDef ok fill:#E1F5EE,stroke:#0F6E56,color:#085041
-    class K1,K2,K3,K4 klaer
-    class P frei
-    class S,X ok
+    classDef best fill:#EEEDFE,stroke:#534AB7,color:#3C3489
+    classDef start fill:#F1EFE8,stroke:#5F5E5A,color:#2C2C2A
+    class R,P,V,D,G3,G5 neu
+    class A1,B1 klaer
+    class C1 frei
+    class K,G4 best
+    class M start
 ```
 
-## Verarbeitungsablauf
-
-1. Eine E-Mail mit eRechnungs-Anhang geht ein.
-2. Das System liest die E-Mail und übernimmt Absender, Betreff, Empfangsdatum und Anhänge.
-3. Das System prüft, ob ein unterstütztes eRechnungsformat vorliegt (ZUGFeRD, Factur-X, XRechnung, UBL oder CII).
-4. Die Rechnungsdaten werden ausgelesen und in das bestehende Dokumentmodell übernommen.
-5. Das System erhebt alle Befunde vollständig, bevor es entscheidet.
-6. Die Geschäftsregeln werden in fester Priorität angewendet.
-
-## Befunderhebung
-
-Vor der Entscheidung werden alle Prüfungen ausgeführt und ihre Ergebnisse gesammelt. Die Verarbeitung bricht nicht beim ersten Treffer ab.
-
-| Befund | Prüfung |
-|---|---|
-| Belegart | Rechnung oder Gutschrift, z. B. über den TypeCode (380 = Rechnung, 381 = Gutschrift) |
-| Validierung | Dieselben Prüfregeln, die heute über den Button „Geprüft“ ausgelöst werden |
-| Dublette | Gleicher Lieferant und gleiche Rechnungsnummer bereits vorhanden |
-| Vermieter | Die Rechnung gehört zu einem Vermieterprozess |
-
-Die Belegart wird direkt nach dem Einlesen bestimmt. Viele Validierungsregeln sind auf Rechnungen ausgelegt und würden bei Gutschriften fälschlich fehlschlagen, etwa bei negativen Beträgen.
-
-Ein Klärfall enthält dadurch alle erkannten Gründe auf einmal, nicht nur den ersten.
+Legende: grün = neu, lila = wiederverwendet, rot = Klärfall, gelb = Freigabe.
 
 ## Entscheidungslogik
 
-Die Regeln werden in dieser Reihenfolge angewendet. Die erste zutreffende Regel bestimmt den Status. Keine spätere Regel darf eine Rechnung in einen „besseren“ Status bringen, wenn eine frühere Regel sie aufhalten müsste.
+| Fall | Bedingung | Status | Aktion |
+|---|---|---|---|
+| A | Rechnung nicht verarbeitbar oder Validierung fehlgeschlagen | 4 Klärfall | `saveDocumentClarification()`, erscheint im bestehenden Klärungsprozess |
+| B | Dokumenttyp = Gutschrift | 4 Klärfall | Vorläufig immer Klärfall, fachliche Entscheidung offen, keine Fakturierung |
+| C | Payer = Vermieter | 8 Freigabe ausstehend | Rechnung gespeichert, keine D365-Übergabe, wartet auf manuelle Genehmigung |
+| D | Normale Rechnung ohne Fehler | 3 Geprüft → 5 Fakturiert | `DocumentsSaveData.sentToD365()` |
 
-| Priorität | Regel | Ergebnis |
-|---|---|---|
-| 1 | Technischer Fehler (Format nicht unterstützt oder nicht lesbar) | Klärfall, Status: Klärung |
-| 2 | Fachlicher Fehler (mindestens eine Validierung schlägt fehl) | Klärfall, Status: Klärung |
-| 3 | Dublettenverdacht (Lieferant + Rechnungsnummer bereits vorhanden) | Klärfall, Status: Klärung |
-| 4 | Gutschrift | Klärfall, Status: Klärung |
-| 5 | Vermieter-Rechnung | Freigabepool, Status: Freigabe ausstehend |
-| 6 | Standardrechnung (Fallback) | Status: Geprüft, Übergabe an D365 |
+Die Fälle werden in der Reihenfolge A → B → C → D geprüft. Die erste zutreffende Bedingung bestimmt den Status.
 
-### Klärfälle (Priorität 1–4)
+## Komponenten
 
-- Status: Klärung, mit gespeichertem Klärgrund
-- Originaldatei bleibt erhalten
-- Alle erkannten Fehler werden gespeichert
-- Keine Fakturierung
-- Bei Dubletten: Verweis auf den bestehenden Vorgang
+```mermaid
+flowchart TB
+    subgraph NEU["NEU"]
+      direction TB
+      PROC["ERechnungProcessor<br/><i>steuert Ablauf + Entscheidung</i>"]
+      READER["ERechnungMailReader"]
+      MAIL["ERechnungMail"]
+      PARSER["ERechnungParser"]
+      VALID["ERechnungValidator"]
+      VRES["ValidationResult"]
+      VERR["ValidationError"]
+      STAT["ERechnungStatus<br/>3 · 4 · 5 · 8"]
+    end
+    subgraph BEST["BESTEHEND / WIEDERVERWENDET"]
+      direction TB
+      GET["ImportGetMails"]
+      ZUG["ConvertZUGFeRD"]
+      ILIST["ImportList"]
+      HEAD["DataDocumentHead"]
+      ITEM["DataDocumentItem"]
+      TAX["TaxData"]
+      IVD["ImportValidateData"]
+      DF["DocumentFunctions"]
+      D365["DocumentsSaveData.sentToD365()"]
+      SDC["saveDocumentClarification()"]
+      DCM["DocumentClarificationModelClass"]
+      DOT["DocumentOverviewTable"]
+    end
+    subgraph WEG["ENTFÄLLT FÜR ERECHNUNG"]
+      direction TB
+      X1["ImportFileMerger"]
+      X2["ImportFileHandler.mergeFiles()"]
+      X3["Automatic.mergeFiles()"]
+      X4["ImportRenameFile"]
+      X5["ClarificationCasesInput.fxml"]
+    end
+    PROC --> READER
+    PROC --> PARSER
+    PROC --> VALID
+    PROC --> STAT
+    READER --> MAIL
+    READER -. basiert auf .-> GET
+    READER --> ILIST
+    PARSER -. basiert auf .-> ZUG
+    PARSER --> HEAD
+    PARSER --> ITEM
+    PARSER --> TAX
+    VALID --> IVD
+    VALID --> DF
+    VALID --> VRES
+    VRES --> VERR
+    PROC -->|"A / B"| SDC
+    PROC -->|"D"| D365
+    SDC --> DCM
+    DCM --> DOT
 
-Die Gutschrift-Regel steht bewusst vor der Vermieter-Regel. Eine Vermieter-Gutschrift wird dadurch zum Klärfall und landet nicht im Freigabepool. Die Behandlung elektronischer Gutschriften ist fachlich noch nicht abschließend definiert, bis dahin ist eine manuelle Bearbeitung erforderlich.
+    classDef neu fill:#E1F5EE,stroke:#0F6E56,color:#085041
+    classDef best fill:#EEEDFE,stroke:#534AB7,color:#3C3489
+    classDef weg fill:#F1EFE8,stroke:#888780,color:#5F5E5A,stroke-dasharray:4 3
+    class PROC,READER,MAIL,PARSER,VALID,VRES,VERR,STAT neu
+    class GET,ZUG,ILIST,HEAD,ITEM,TAX,IVD,DF,D365,SDC,DCM,DOT best
+    class X1,X2,X3,X4,X5 weg
+```
 
-### Vermieter-Rechnung (Priorität 5)
+## Verantwortlichkeiten
 
-- Status: Freigabe ausstehend
-- Keine Übergabe an D365
-- Nach der Freigabe Weiterverarbeitung wie eine Standardrechnung
+### Neu
 
-### Standardrechnung (Priorität 6)
+| Klasse | Verantwortung |
+|---|---|
+| `ERechnungProcessor` | Steuert den Ablauf pro E-Mail und trifft die Entscheidung A–D |
+| `ERechnungMailReader` | Liest E-Mails per Microsoft Graph (Basis: `ImportGetMails`), vergibt die Import-ID |
+| `ERechnungMail` | Datenobjekt einer E-Mail: Absender, Betreff, Empfangsdatum, Anhänge, Import-ID |
+| `ERechnungParser` | Liest PDF/XML (Basis: `ConvertZUGFeRD`), erzeugt `DataDocumentHead`, `DataDocumentItem`, `TaxData` |
+| `ERechnungValidator` | Führt die bestehenden Prüfungen aus `ImportValidateData` und `DocumentFunctions` aus |
+| `ValidationResult` | Ergebnis der Validierung: gültig ja/nein, Liste der Fehler |
+| `ValidationError` | Einzelner Fehler mit Feld, Meldung und Ursache |
+| `ERechnungStatus` | Status-Enum: 3 Geprüft, 4 Klärfall, 5 Fakturiert, 8 Freigabe ausstehend |
 
-- Status: Geprüft
-- Übergabe an D365 und Fakturierung gemäß den bestehenden Prozessen
+### Bestehend / wiederverwendet
 
-## Wesentliche Vorteile
+| Klasse | Verwendung |
+|---|---|
+| `ImportGetMails` | Graph-Logik als Grundlage für `ERechnungMailReader` |
+| `ConvertZUGFeRD` | XML-Lese-Logik als Grundlage für `ERechnungParser` |
+| `ImportList` | Ein Eintrag pro E-Mail mit eigener Import-ID |
+| `DataDocumentHead`, `DataDocumentItem`, `TaxData` | Unverändertes Dokumentmodell |
+| `ImportValidateData`, `DocumentFunctions` | Bestehende fachliche Prüfungen |
+| `DocumentsSaveData.sentToD365()` | Übergabe an D365 und Fakturierung |
+| `saveDocumentClarification()` | Anlage des Klärfalls |
+| `DocumentClarificationModelClass` | Datenmodell des Klärfalls |
+| `DocumentOverviewTable` | Anzeige der Vorgänge im bestehenden Prozess |
 
-- Eine E-Mail entspricht genau einem Vorgang.
-- Fehlerhafte Rechnungen blockieren keine anderen Rechnungen.
-- Kein PDF-Merging und keine manuelle Seitenauswahl für Klärfälle mehr.
-- Große Teile der bestehenden Validierungs- und D365-Logik werden wiederverwendet.
-- Feste Prüfreihenfolge sorgt für eindeutige Ergebnisse, auch bei mehreren Befunden.
-- Klärfälle enthalten alle Klärgründe auf einmal.
-- Die Dublettenprüfung schützt vor Doppelfakturierung.
-- Vollständige Nachvollziehbarkeit über den gesamten Lebenszyklus einer Rechnung.
+### Entfällt für eRechnung
 
-## Offene Punkte
+| Klasse | Grund |
+|---|---|
+| `ImportFileMerger` | Keine Sammel-PDFs mehr |
+| `ImportFileHandler.mergeFiles()` | Kein PDF-Merge mehr |
+| `Automatic.mergeFiles()` | Kein PDF-Merge mehr |
+| `ImportRenameFile` | Datei wird nicht mehr für Sammelimporte umbenannt |
+| `ClarificationCasesInput.fxml` | Keine manuelle Seitenauswahl für Klärfälle mehr |
 
-- [ ] Fachliche Definition der Gutschrift-Behandlung
-- [ ] Dublettenerkennung: nur Lieferant + Rechnungsnummer, oder zusätzlich Betrag und Datum?
-- [ ] Wer gibt Vermieter-Rechnungen frei? Gibt es eine Frist oder Eskalation?
-- [ ] E-Mails mit mehreren eRechnungen: ein Vorgang oder mehrere?
+Diese Klassen entfallen nur für den eRechnungs-Pfad. Solange es noch Papier- oder Nicht-eRechnungen gibt, bleiben sie für diese Fälle bestehen.
